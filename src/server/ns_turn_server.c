@@ -2972,7 +2972,11 @@ static int handle_turn_send(turn_turnserver *server, ts_ur_super_session *ss,
 				ioa_network_buffer_handle nbh = in_buffer->nbh;
 				if(value && len>0) {
 					u16bits offset = (u16bits)(value - ioa_network_buffer_data(nbh));
-					ioa_network_buffer_add_offset_size(nbh,offset,0,len);
+					/* without remove stun head for bev process, qing.zou */
+					if (in_buffer->handle_bev)
+						offset = 0;
+					else
+						ioa_network_buffer_add_offset_size(nbh,offset,0,len);
 				} else {
 					len = 0;
 					ioa_network_buffer_set_size(nbh,len);
@@ -3812,6 +3816,17 @@ static int handle_turn_command(turn_turnserver *server, ts_ur_super_session *ss,
 
 				if(eve(server->verbose)) {
 				  log_method(ss, "SEND", err_code, reason);
+				}
+
+				break;
+
+				/* add */
+			case STUN_METHOD_SETTING:
+
+				handle_turn_send(server, ss, &err_code, &reason, unknown_attrs, &ua_num, in_buffer);
+
+				if(eve(server->verbose)) {
+					log_method(ss, "SET", err_code, reason);
 				}
 
 				break;
@@ -4686,6 +4701,56 @@ static void peer_input_handler(ioa_socket_handle s, int event_type,
 	int ilen = min((int)ioa_network_buffer_get_size(in_buffer->nbh),
 			(int)(ioa_network_buffer_get_capacity_udp() - offset));
 
+	/* added by qing.zou */
+	if (ilen > 0 
+		&& stun_is_command_message_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh)) 
+		&& stun_is_indication_str(ioa_network_buffer_data(in_buffer->nbh), ioa_network_buffer_get_size(in_buffer->nbh))) 
+	{
+
+TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "stun_is_indication_str========== %s:%d\n", __FILE__, __LINE__);
+		u16bits method = stun_get_method_str(ioa_network_buffer_data(in_buffer->nbh), 
+			ioa_network_buffer_get_size(in_buffer->nbh));
+
+		/* just process method of mine */
+		if (method == STUN_METHOD_SETTING) {
+			stun_attr_ref sar = stun_attr_get_first_str(ioa_network_buffer_data(in_buffer->nbh),
+				ioa_network_buffer_get_size(in_buffer->nbh));
+			while (sar /*&& (*ua_num < MAX_NUMBER_OF_UNKNOWN_ATTRS)*/) {
+				int attr_type = stun_attr_get_type(sar);
+				switch (attr_type) 
+				{
+					//SKIP_ATTRIBUTES;
+				case STUN_ATTRIBUTE_DONT_FRAGMENT:
+					break;
+				case STUN_ATTRIBUTE_XOR_PEER_ADDRESS:
+					break;
+				case STUN_ATTRIBUTE_DATA: {
+					const u08bits* value = NULL;
+					//len = stun_attr_get_len(sar);
+					value = stun_attr_get_value(sar);
+					u08bits enable = value[0];
+		    		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "========== %s:%d socket: 0x%lx, set bev state: %d \n", __FILE__, __LINE__, ss->client_socket, enable);
+					if (ss->client_socket)
+						set_ioa_socket_bufferevent_state(ss->client_socket, enable);
+					}
+					break;
+				default:
+					break;
+				};
+				sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh),
+					ioa_network_buffer_get_size(in_buffer->nbh), sar);
+			}
+
+			return;
+		}
+
+TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "stun_is_indication_str [0x%04x] isnot mine ========== %s:%d\n", method, __FILE__, __LINE__);
+		//ioa_network_buffer_delete(server->e, in_buffer->nbh);
+		//in_buffer->nbh = NULL;
+
+		//return;
+	}
+
 	if (ilen >= 0) {
 
 		allocation* a = get_allocation_ss(ss);
@@ -4760,9 +4825,58 @@ static void peer_input_handler(ioa_socket_handle s, int event_type,
 						(int) (nswap16(t[0])));
 			}
 
+			/* add */
+			set_ioa_socket_peer_addr(ss->client_socket, &(in_buffer->src_addr));
 			write_client_connection(server, ss, nbh, in_buffer->recv_ttl-1, in_buffer->recv_tos);
 		}
 	}
+}
+
+int get_turn_peer_addr(ioa_net_data *in_buffer, ioa_addr *peer_addr)
+{
+	//u16bits ua_num = 0;
+
+	addr_set_any(peer_addr);
+	stun_attr_ref sar = stun_attr_get_first_str(ioa_network_buffer_data(in_buffer->nbh),
+		ioa_network_buffer_get_size(in_buffer->nbh));
+	while (sar /*&& (*ua_num < MAX_NUMBER_OF_UNKNOWN_ATTRS)*/) {
+		int attr_type = stun_attr_get_type(sar);
+		switch (attr_type) {
+			//SKIP_ATTRIBUTES;
+			case STUN_ATTRIBUTE_DONT_FRAGMENT:
+				break;
+			case STUN_ATTRIBUTE_XOR_PEER_ADDRESS:
+				stun_attr_get_addr_str(ioa_network_buffer_data(in_buffer->nbh), 
+					ioa_network_buffer_get_size(in_buffer->nbh), sar, peer_addr, NULL);
+				break;
+			case STUN_ATTRIBUTE_DATA:
+				break;
+			default:
+				break;
+		};
+		sar = stun_attr_get_next_str(ioa_network_buffer_data(in_buffer->nbh),
+			ioa_network_buffer_get_size(in_buffer->nbh), sar);
+	}
+	return 0;
+}
+
+ioa_network_buffer_handle socket_stun_setting_create(turn_turnserver *server, ioa_addr peer_addr, u08bits enable)
+{
+	size_t len = 0;
+	ioa_network_buffer_handle nbh = NULL;
+	u08bits b[4] = {0};
+
+	b[0] = enable;
+
+	nbh = ioa_network_buffer_allocate(server->e);
+	stun_init_indication_str(STUN_METHOD_SETTING, ioa_network_buffer_data(nbh), &len);
+	stun_attr_add_str(ioa_network_buffer_data(nbh), &len, STUN_ATTRIBUTE_DATA, (u08bits*)b, sizeof(b));
+//		ioa_network_buffer_data(in_buffer->nbh), (size_t)ilen);
+	stun_attr_add_addr_str(ioa_network_buffer_data(nbh), &len,
+		STUN_ATTRIBUTE_XOR_PEER_ADDRESS, &peer_addr);
+	ioa_network_buffer_set_size(nbh,len);
+
+	return nbh;
 }
 
 static void client_input_handler(ioa_socket_handle s, int event_type,
@@ -4785,8 +4899,30 @@ static void client_input_handler(ioa_socket_handle s, int event_type,
 	if (ss->client_socket != s) {
 		return;
 	}
+	
+	/* add */
+	if (data->handle_bev) {
+		ioa_addr peer_addr;
 
-	read_client_connection(server, ss, data, can_resume, 1);
+TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "handle_bev========== %s:%d\n", __FILE__, __LINE__);
+		//get_turn_peer_addr(data, &peer_addr);
+		addr_cpy(&peer_addr, &(data->src_addr));
+
+		ioa_network_buffer_handle nbh = socket_stun_setting_create(server, peer_addr, data->enable_bev);
+
+		ioa_net_data nd;
+
+		ns_bzero(&nd, sizeof(ioa_net_data));
+		addr_cpy(&(nd.src_addr), &peer_addr);
+		nd.nbh = nbh;
+		nd.recv_ttl = 64;
+		nd.recv_tos = 0;
+		nd.handle_bev = 1;
+		nd.enable_bev = data->enable_bev;
+
+		read_client_connection(server, ss, &nd, can_resume, 1);
+	} else
+		read_client_connection(server, ss, data, can_resume, 1);
 
 	if (ss->to_be_closed) {
 		if(server->verbose) {

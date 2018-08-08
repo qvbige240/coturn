@@ -66,6 +66,7 @@ extern "C" {
 #define MAX_BUFFER_QUEUE_SIZE_PER_ENGINE (64)
 #define MAX_SOCKET_BUFFER_BACKLOG (16)
 
+#define BUFFEREVENT_LOW_WATERMARK (4<<10)
 #define BUFFEREVENT_HIGH_WATERMARK (128<<10)
 #define BUFFEREVENT_MAX_UDP_TO_TCP_WRITE (64<<9)
 #define BUFFEREVENT_MAX_TCP_TO_TCP_WRITE (192<<10)
@@ -77,6 +78,7 @@ typedef struct _stun_buffer_list_elem {
 
 typedef struct _stun_buffer_list {
 	stun_buffer_list_elem *head;
+	stun_buffer_list_elem *tail;
 	size_t tsz;
 } stun_buffer_list;
 
@@ -178,6 +180,14 @@ struct traffic_bytes {
 
 struct _ioa_socket
 {
+	/* add qing.zou */
+	int cached;
+	stun_buffer_list buff_list;
+
+	ioa_addr peer_addr;
+	ioa_addr cache_addr;	/* for member cached */
+
+
 	evutil_socket_t fd;
 	struct _ioa_socket *parent_s;
 	u32bits magic;

@@ -128,6 +128,9 @@ typedef struct _ioa_net_data {
 	ioa_network_buffer_handle	nbh;
 	int				recv_ttl;
 	int				recv_tos;
+
+	int				handle_bev;
+	int				enable_bev;
 } ioa_net_data;
 
 /* Callback on TCP connection completion */
@@ -181,6 +184,10 @@ void ioa_network_buffer_add_offset_size(ioa_network_buffer_handle nbh, u16bits o
 u16bits ioa_network_buffer_get_offset(ioa_network_buffer_handle nbh);
 u08bits ioa_network_buffer_get_coffset(ioa_network_buffer_handle nbh);
 void ioa_network_buffer_delete(ioa_engine_handle e, ioa_network_buffer_handle nbh);
+/* added by qing.zou */
+int ioa_network_buffer_in_cached(ioa_socket_handle s, ioa_network_buffer_handle nbh);
+void ioa_network_buffer_cache_list(ioa_socket_handle s, ioa_network_buffer_handle nbh);
+ioa_network_buffer_handle ioa_network_buffer_cache_list_pop(ioa_socket_handle s);
 
 /*
  * Status reporting functions
@@ -250,6 +257,10 @@ void clear_ioa_socket_session_if(ioa_socket_handle s, void *ss);
 tcp_connection *get_ioa_socket_sub_session(ioa_socket_handle s);
 void set_ioa_socket_sub_session(ioa_socket_handle s, tcp_connection *tc);
 int register_callback_on_ioa_socket(ioa_engine_handle e, ioa_socket_handle s, int event_type, ioa_net_event_handler cb, void *ctx, int clean_preexisting);
+/* add */
+void set_ioa_socket_peer_addr(ioa_socket_handle s, ioa_addr* peer_addr);
+int set_ioa_socket_bufferevent_state(ioa_socket_handle s, int enable);
+
 int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr* dest_addr, ioa_network_buffer_handle nbh, int ttl, int tos, int *skip);
 void close_ioa_socket(ioa_socket_handle s);
 #define IOA_CLOSE_SOCKET(S) do { if(S) { close_ioa_socket(S); S = NULL; } } while(0)

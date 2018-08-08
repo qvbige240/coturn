@@ -45,6 +45,8 @@ typedef struct _stun_buffer {
   size_t	len;
   u16bits	offset;
   u08bits	coffset;
+
+  u08bits	retry;
 } stun_buffer;
 
 //////////////////////////////////////////////////////////////

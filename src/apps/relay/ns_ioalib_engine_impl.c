@@ -255,6 +255,24 @@ static int buffer_list_empty(stun_buffer_list *bufs)
 	return 1;
 }
 
+static stun_buffer_list_elem *get_elem_from_buffer_cache_list(stun_buffer_list *bufs)
+{
+	stun_buffer_list_elem *node = NULL;
+
+	if(bufs && bufs->head && bufs->tsz) {
+
+		node = bufs->head;
+		bufs->head = node->next;
+		--bufs->tsz;
+		if (bufs->tsz == 0)
+			bufs->tail = NULL;
+
+		node->next = NULL;
+	}
+
+	return node;
+}
+
 static stun_buffer_list_elem *get_elem_from_buffer_list(stun_buffer_list *bufs)
 {
 	stun_buffer_list_elem *ret = NULL;
@@ -264,11 +282,15 @@ static stun_buffer_list_elem *get_elem_from_buffer_list(stun_buffer_list *bufs)
 		ret=bufs->head;
 		bufs->head=ret->next;
 		--bufs->tsz;
+		if (bufs->tsz == 0)
+			bufs->tail = NULL;
 
 		ret->next=NULL;
 		ret->buf.len = 0;
 		ret->buf.offset = 0;
 		ret->buf.coffset = 0;
+
+		ret->buf.retry = 0;
 	}
 
 	return ret;
@@ -281,11 +303,11 @@ static void pop_elem_from_buffer_list(stun_buffer_list *bufs)
 		stun_buffer_list_elem *ret = bufs->head;
 		bufs->head=ret->next;
 		--bufs->tsz;
+		if (bufs->tsz == 0)
+			bufs->tail = NULL;
 		turn_free(ret,sizeof(stun_buffer_list_elem));
 	}
 }
-
-
 
 static stun_buffer_list_elem *new_blist_elem(ioa_engine_handle e)
 {
@@ -297,6 +319,8 @@ static stun_buffer_list_elem *new_blist_elem(ioa_engine_handle e)
 	  ret->buf.offset = 0;
 	  ret->buf.coffset = 0;
 	  ret->next = NULL;
+
+	  ret->buf.retry = 0;
 	}
 
 	return ret;
@@ -307,6 +331,23 @@ static inline void add_elem_to_buffer_list(stun_buffer_list *bufs, stun_buffer_l
 	buf_elem->next = bufs->head;
 	bufs->head = buf_elem;
 	bufs->tsz += 1;
+
+	if (bufs->tsz == 1)
+		bufs->tail = buf_elem;
+}
+
+static inline void add_elem_to_buffer_list_tail(stun_buffer_list *bufs, stun_buffer_list_elem *buf_elem)
+{
+	if (bufs->tail)
+		bufs->tail->next = buf_elem;
+	//else
+	//	bufs->head = buf_elem;
+
+	bufs->tail = buf_elem;
+	bufs->tsz += 1;
+
+	if (bufs->tsz == 1)
+		bufs->head = buf_elem;
 }
 
 static void add_buffer_to_buffer_list(stun_buffer_list *bufs, s08bits *buf, size_t len)
@@ -2647,6 +2688,20 @@ static void socket_output_handler_bev(struct bufferevent *bev, void* arg)
 				}
 				return;
 			}
+			/* add */
+			if (s->cached) {
+				if (is_socket_writeable(s, (size_t) 1024 * 2, __FUNCTION__, 2)) {
+
+					int skip = 0;
+					int ret = send_data_from_ioa_socket_nbh(s, NULL, NULL, 64, 0, &skip);
+					//int ret = send_data_from_ioa_socket_nbh(s, NULL, NULL, ttl, tos, &skip);
+					if (skip)
+						;
+						// send udp msg to bufferevent_read...
+				} 
+
+
+			}
 
 			if (s->sub_session) {
 
@@ -3082,15 +3137,67 @@ int udp_send(ioa_socket_handle s, const ioa_addr* dest_addr, const s08bits* buff
 	return rc;
 }
 
+void set_ioa_socket_peer_addr(ioa_socket_handle s, ioa_addr* peer_addr)
+{
+	addr_cpy(&s->peer_addr, peer_addr);
+}
+
+int set_ioa_socket_bufferevent_state(ioa_socket_handle s, int enable)
+{
+	if (!s) return -1;
+
+	if (enable)
+		return bufferevent_enable(s->bev, EV_READ); /* Start reading. */
+	else
+		return bufferevent_disable(s->bev, EV_READ);
+}
+
+static int send_ioa_socket_bufferevent_setting(ioa_socket_handle s, int enable)
+{
+	if(s->read_cb) {
+		ioa_net_data nd;
+
+		ns_bzero(&nd, sizeof(ioa_net_data));
+		addr_cpy(&(nd.src_addr), &s->cache_addr);
+		//nd.nbh = nbh;	//...
+		nd.recv_ttl = 64;
+		nd.recv_tos = 0;
+		nd.handle_bev = 1;
+		nd.enable_bev = enable;
+
+		s->read_cb(s, IOA_EV_READ, &nd, s->read_ctx, 1);
+
+	}
+	return 0;
+}
+
 int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr* dest_addr,
 				ioa_network_buffer_handle nbh,
 				int ttl, int tos, int *skip)
 {
 	int ret = -1;
+	int retry = 0;
 
 	if(!s) {
 		ioa_network_buffer_delete(NULL, nbh);
 		return -1;
+	}
+
+	/* add */
+	if (s->cached && !nbh) {
+		if (!buffer_list_empty(&(s->buff_list)))
+			nbh = ioa_network_buffer_cache_list_pop(s);
+		else {
+
+			/* send to target session client to enable bev read */
+			send_ioa_socket_bufferevent_setting(s, 1);
+			s->cached = 0;
+			if(skip) *skip = 1;
+
+			//is_droped = 0;//test
+
+			return 0;
+		}
 	}
 
 	if (s->done || (s->fd == -1)) {
@@ -3130,28 +3237,47 @@ int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr* dest_addr,
 
 							if (!tcp_congestion_control || is_socket_writeable(
 									s, (size_t) ret, __FUNCTION__, 2)) {
-								s->in_write = 1;
-								if (bufferevent_write(s->bev,
-										ioa_network_buffer_data(nbh),
-										ioa_network_buffer_get_size(nbh)) < 0) {
-									ret = -1;
-									perror("bufev send");
-									log_socket_event(
-											s,
-											"socket write failed, to be closed",
-											1);
-									s->tobeclosed = 1;
-									s->broken = 1;
+
+								if (s->cached && !ioa_network_buffer_in_cached(s, nbh)) {
+									retry = 1;
+									ioa_network_buffer_cache_list(s, nbh);
+								} else {
+
+									s->in_write = 1;
+									if (bufferevent_write(s->bev,
+											ioa_network_buffer_data(nbh),
+											ioa_network_buffer_get_size(nbh)) < 0) {
+										ret = -1;
+										perror("bufev send");
+										log_socket_event(
+												s,
+												"socket write failed, to be closed",
+												1);
+										s->tobeclosed = 1;
+										s->broken = 1;
+									}
+									/*
+									bufferevent_flush(s->bev,
+													EV_READ|EV_WRITE,
+													BEV_FLUSH);
+													*/
+									s->in_write = 0;
+
 								}
-								/*
-								bufferevent_flush(s->bev,
-												EV_READ|EV_WRITE,
-												BEV_FLUSH);
-												*/
-								s->in_write = 0;
 							} else {
 								//drop the packet
 								;
+								TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "========= %s drop/cache packet[%d] socket: 0x%lx \n", __FUNCTION__, ret,(long)s);
+								//is_droped = 1; //test
+
+								retry = 1;
+								ioa_network_buffer_cache_list(s, nbh);
+								if (s->cached == 0) {
+									s->cached = 1;
+									addr_cpy(&s->cache_addr, &s->peer_addr);
+								}
+								/* send disable */
+								send_ioa_socket_bufferevent_setting(s, 0);
 							}
 						}
 					} else if (s->ssl) {
@@ -3203,6 +3329,7 @@ int send_data_from_ioa_socket_nbh(ioa_socket_handle s, ioa_addr* dest_addr,
 		}
 	}
 
+	if (!retry)
 	ioa_network_buffer_delete(s->e, nbh);
 
 	return ret;
@@ -3336,6 +3463,7 @@ int register_callback_on_ioa_socket(ioa_engine_handle e, ioa_socket_handle s, in
 						bufferevent_setcb(s->bev, socket_input_handler_bev, socket_output_handler_bev,
 										eventcb_bev, s);
 						bufferevent_setwatermark(s->bev, EV_READ|EV_WRITE, 0, BUFFEREVENT_HIGH_WATERMARK);
+						//bufferevent_setwatermark(s->bev, EV_WRITE, BUFFEREVENT_LOW_WATERMARK, BUFFEREVENT_HIGH_WATERMARK);
 						bufferevent_enable(s->bev, EV_READ|EV_WRITE); /* Start reading. */
 					}
 					break;
@@ -3519,6 +3647,38 @@ u08bits ioa_network_buffer_get_coffset(ioa_network_buffer_handle nbh)
 void ioa_network_buffer_delete(ioa_engine_handle e, ioa_network_buffer_handle nbh) {
   stun_buffer_list_elem *buf_elem = (stun_buffer_list_elem *)nbh;
   free_blist_elem(e,buf_elem);
+}
+
+/* added by qing.zou */
+void ioa_network_buffer_cache_list(ioa_socket_handle s, ioa_network_buffer_handle nbh) {
+	stun_buffer_list_elem *buf_elem = (stun_buffer_list_elem *)nbh;	
+	if(buf_elem && s) {
+		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "========= cache size[%d] retry: %d socket: 0x%lx \n", s->buff_list.tsz, buf_elem->buf.retry,(long)s);
+
+		if (buf_elem->buf.retry) {
+			buf_elem->buf.retry += 1;	//...
+			add_elem_to_buffer_list(&(s->buff_list), buf_elem);
+		} else {
+			buf_elem->buf.retry = 1;
+			add_elem_to_buffer_list_tail(&(s->buff_list), buf_elem);
+		}
+	}
+}
+
+int ioa_network_buffer_in_cached(ioa_socket_handle s, ioa_network_buffer_handle nbh) {
+	stun_buffer_list_elem *buf_elem = (stun_buffer_list_elem *)nbh;	
+	if(buf_elem && s) {
+		return buf_elem->buf.retry > 0 ? 1 : 0;
+	}
+	return -1;
+}
+
+ioa_network_buffer_handle ioa_network_buffer_cache_list_pop(ioa_socket_handle s) {
+	stun_buffer_list_elem *buf_elem = NULL;
+	if (s)
+		buf_elem = get_elem_from_buffer_cache_list(&(s->buff_list));
+
+	return (ioa_network_buffer_handle)buf_elem;
 }
 
 /////////// REPORTING STATUS /////////////////////
